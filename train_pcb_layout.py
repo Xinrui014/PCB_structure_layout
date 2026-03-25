@@ -111,7 +111,7 @@ def main():
     parser.add_argument("--gpu", type=int, default=0)
     args = parser.parse_args()
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(args.gpu))
     os.environ["WANDB_PROJECT"] = "pcb_layout"
 
     print(f"Loading tokenizer and model: {args.model_name}")

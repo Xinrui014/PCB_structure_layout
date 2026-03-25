@@ -7,3 +7,7 @@ logs/
 __pycache__/
 *.pyc
 .DS_Store
+__pycache__/
+test_output/
+wandb/
+*.csv
