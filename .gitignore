@@ -1,0 +1,9 @@
+runs/
+re-annotation/
+re-orientation/
+component_pool/
+archive/
+logs/
+__pycache__/
+*.pyc
+.DS_Store
