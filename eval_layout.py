@@ -3,16 +3,9 @@
 Layout Constraint Evaluation Script
 Evaluates hard constraints and layout quality metrics for PCB layout generation.
 
-Metrics:
-  Hard constraints (binary per component):
-    1. boundary_rate     — % components fully within 512x512
-    2. overlap_rate      — % components with zero overlap with others
-  
-  Soft / quality metrics (vs. ground truth):
-    3. count_accuracy    — exact match of total component count
-    4. category_accuracy — per-category count match (macro avg)
-    5. iou_score         — mean best IoU (each GT comp matched to nearest pred)
-    6. coverage          — what fraction of GT components have a matching pred (IoU > 0.3)
+Supports both:
+- v1 format: [TYPE] [X] [Y] [W] [H] ... on 512x512
+- v2 format: [COLOR_*] [R1-R7] [TYPE] [X] [Y] [W] [H] ... on 1280x720
 """
 
 import json, re, torch, random, argparse
@@ -20,39 +13,51 @@ from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
-# ── Config ──────────────────────────────────────────────────────────────────
-CKPT     = "/home/xinrui/projects/PCB_structure_layout/runs/qwen3b_lora/checkpoint-9000"
-BASE     = "Qwen/Qwen2.5-3B-Instruct"
-TEST_JSONL = "/home/xinrui/projects/data/ti_pcb/layout_data/test.jsonl"
-CANVAS   = 512
-CATEGORIES = {"RESISTOR","CAPACITOR","INDUCTOR","CONNECTOR","DIODE","LED","SWITCH","TRANSISTOR","IC"}
+CKPT = "/home/xinrui/projects/PCB_structure_layout/runs/qwen3b_lora/checkpoint-9000"
+BASE = "Qwen/Qwen2.5-3B-Instruct"
+TEST_JSONL = "/home/xinrui/projects/data/ti_pcb/layout_data/v2_Color_Res_Class_xywh/test.jsonl"
+CANVAS_W = 1280
+CANVAS_H = 720
+CATEGORIES = {"RESISTOR","CAPACITOR","INDUCTOR","CONNECTOR","DIODE","LED","SWITCH","TRANSISTOR","IC","OSCILLATOR"}
+RESOLUTION_TOKENS = {f"R{i}" for i in range(1, 8)}
+COLOR_TOKENS = {"COLOR_GREEN", "COLOR_RED", "COLOR_BLUE", "COLOR_BLACK", "COLOR_WHITE", "COLOR_GREY", "COLOR_GRAY"}
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
 def parse_layout(text):
     components = []
-    tokens = re.findall(r'\[(\w+)\]', text)
+    meta = {"board_color": None, "resolution": None}
+    tokens = re.findall(r'\[([^\[\]]+)\]', text)
     i = 0
     while i < len(tokens):
         t = tokens[i]
+        if t in COLOR_TOKENS:
+            meta["board_color"] = t
+            i += 1
+            continue
+        if t in RESOLUTION_TOKENS:
+            meta["resolution"] = t
+            i += 1
+            continue
         if t in CATEGORIES and i + 4 < len(tokens):
             try:
-                x,y,w,h = int(tokens[i+1]),int(tokens[i+2]),int(tokens[i+3]),int(tokens[i+4])
-                components.append({"type":t,"x":x,"y":y,"w":w,"h":h})
-                i += 5; continue
-            except ValueError: pass
+                x,y,w,h = int(tokens[i+1]), int(tokens[i+2]), int(tokens[i+3]), int(tokens[i+4])
+                if w > 0 and h > 0:
+                    components.append({"type":t,"x":x,"y":y,"w":w,"h":h})
+                i += 5
+                continue
+            except ValueError:
+                pass
         i += 1
-    return components
+    return components, meta
 
 # ── Hard Constraint Metrics ──────────────────────────────────────────────────
-def boundary_rate(comps, canvas=CANVAS):
-    """Fraction of components fully within canvas."""
+def boundary_rate(comps, canvas_w=CANVAS_W, canvas_h=CANVAS_H):
     if not comps: return 1.0
     ok = sum(1 for c in comps if c["x"] >= 0 and c["y"] >= 0
-             and c["x"]+c["w"] <= canvas and c["y"]+c["h"] <= canvas)
+             and c["x"]+c["w"] <= canvas_w and c["y"]+c["h"] <= canvas_h)
     return ok / len(comps)
 
 def overlap_rate(comps):
-    """Fraction of components that do NOT overlap with any other component."""
     if len(comps) <= 1: return 1.0
     def intersects(a, b):
         return not (a["x"]+a["w"] <= b["x"] or b["x"]+b["w"] <= a["x"] or
@@ -65,10 +70,6 @@ def overlap_rate(comps):
 
 # ── Quality Metrics ──────────────────────────────────────────────────────────
 def parse_prompt_counts(prompt):
-    """Parse expected per-class counts directly from the prompt string.
-    e.g. 'Generate a PCB layout with 30 capacitors, 4 ICs, 1 connector'
-    → {'CAPACITOR': 30, 'IC': 4, 'CONNECTOR': 1}
-    """
     import re
     name_map = {
         "capacitor": "CAPACITOR", "capacitors": "CAPACITOR",
@@ -80,9 +81,9 @@ def parse_prompt_counts(prompt):
         "switch": "SWITCH",       "switches": "SWITCH",
         "transistor": "TRANSISTOR","transistors": "TRANSISTOR",
         "ic": "IC",               "ics": "IC",
+        "oscillator": "OSCILLATOR", "oscillators": "OSCILLATOR",
     }
     counts = {}
-    # match patterns like "30 capacitors" or "4 ICs"
     for match in re.finditer(r'(\d+)\s+([a-zA-Z]+)', prompt):
         num  = int(match.group(1))
         word = match.group(2).lower()
@@ -92,14 +93,6 @@ def parse_prompt_counts(prompt):
     return counts
 
 def prompt_count_accuracy(prompt, pred):
-    """
-    Hard constraint: does the predicted layout match the per-class counts
-    specified in the prompt?
-    Returns:
-      - per_class_match: dict {cat: (expected, predicted, match)}
-      - exact_match_rate: fraction of required classes with exact count match
-      - overall_exact: 1.0 if ALL classes match exactly
-    """
     expected = parse_prompt_counts(prompt)
     from collections import Counter
     pred_cnt = Counter(c["type"] for c in pred)
@@ -117,22 +110,19 @@ def prompt_count_accuracy(prompt, pred):
     return per_class, exact_match_rate, overall_exact
 
 def count_accuracy(gt, pred):
-    """1 if exact total count match, else 0."""
     return 1.0 if len(gt) == len(pred) else 0.0
 
 def category_accuracy(gt, pred):
-    """Per-category count match, macro averaged over present GT categories."""
     from collections import Counter
     gt_cnt   = Counter(c["type"] for c in gt)
     pred_cnt = Counter(c["type"] for c in pred)
     scores = []
     for cat, gt_n in gt_cnt.items():
         pred_n = pred_cnt.get(cat, 0)
-        scores.append(min(pred_n, gt_n) / gt_n)   # precision-like per category
+        scores.append(min(pred_n, gt_n) / gt_n)
     return sum(scores)/len(scores) if scores else 0.0
 
 def iou(a, b):
-    """IoU between two bboxes [x,y,w,h]."""
     ax1,ay1,ax2,ay2 = a["x"],a["y"],a["x"]+a["w"],a["y"]+a["h"]
     bx1,by1,bx2,by2 = b["x"],b["y"],b["x"]+b["w"],b["y"]+b["h"]
     inter_w = max(0, min(ax2,bx2)-max(ax1,bx1))
@@ -142,7 +132,6 @@ def iou(a, b):
     return inter/union if union > 0 else 0.0
 
 def mean_best_iou(gt, pred, iou_thresh=0.3):
-    """For each GT comp, find best matching pred IoU. Returns mean IoU and coverage."""
     if not gt or not pred: return 0.0, 0.0
     best_ious = []
     for g in gt:
@@ -159,6 +148,7 @@ def main():
     parser.add_argument("--ckpt", type=str, default=CKPT)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu", type=int, default=2)
+    parser.add_argument("--max_new_tokens", type=int, default=2048)
     args = parser.parse_args()
 
     print(f"Loading model from {args.ckpt} ...")
@@ -177,17 +167,17 @@ def main():
     samples = random.sample(test_data, min(n, len(test_data)))
 
     system_msg = ("You are a PCB layout generator. Given a description of components, "
-                  "output their placement as a sequence of tokens representing component "
-                  "type, x-position, y-position, width, and height on a 512x512 board.")
+                  "output their placement as a sequence of tokens representing board-level "
+                  "attributes followed by component type, x-position, y-position, width, "
+                  "and height on a 1280x720 board.")
 
-    # Accumulators
     metrics = {
         "boundary_rate": [],
         "overlap_rate": [],
-        "prompt_class_exact_rate": [],   # fraction of required classes with exact count
-        "prompt_all_classes_exact": [],  # 1 if ALL classes match prompt exactly
-        "count_accuracy": [],            # exact total count match vs GT
-        "category_accuracy": [],         # per-category match vs GT
+        "prompt_class_exact_rate": [],
+        "prompt_all_classes_exact": [],
+        "count_accuracy": [],
+        "category_accuracy": [],
         "mean_iou": [],
         "coverage": [],
     }
@@ -203,11 +193,11 @@ def main():
         inputs = tok(text, return_tensors="pt").to(model.device)
 
         with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=1024, do_sample=False)
+            out = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False)
         pred_text = tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
-        gt   = parse_layout(gt_text)
-        pred = parse_layout(pred_text)
+        gt, gt_meta     = parse_layout(gt_text)
+        pred, pred_meta = parse_layout(pred_text)
 
         br   = boundary_rate(pred)
         or_  = overlap_rate(pred)
@@ -225,13 +215,12 @@ def main():
         metrics["mean_iou"].append(miou)
         metrics["coverage"].append(cov)
 
-        # Per-class detail string
         cls_detail = " | ".join(
             f"{cat}:{v['expected']}→{v['predicted']}{'✓' if v['match'] else '✗'}"
             for cat, v in per_class.items()
         )
         print(f"[{i+1:3d}/{len(samples)}] GT={len(gt):3d} Pred={len(pred):3d} | "
-              f"bound={br:.2f} overlap={or_:.2f} iou={miou:.3f} cov={cov:.2f}")
+              f"bound={br:.2f} overlap={or_:.2f} iou={miou:.3f} cov={cov:.2f} | meta={pred_meta}")
         print(f"  Prompt counts: {cls_detail}")
 
     print("\n" + "="*60)
