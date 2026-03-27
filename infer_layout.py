@@ -307,6 +307,10 @@ def main():
     parser.add_argument("--top_k", type=int, default=10,
                         help="Top-K candidates for component matching (used with --paste)")
     parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument("--test_jsonl", default=TEST_JSONL,
+                        help="Path to test.jsonl")
+    parser.add_argument("--board_img_dir", default=BOARD_IMG_DIR,
+                        help="Path to board images dir")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -324,7 +328,7 @@ def main():
     print("\nLoading model...")
     tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        base_model, dtype=torch.bfloat16,
+        base_model, torch_dtype=torch.bfloat16,
         device_map=f"cuda:{args.gpu}", trust_remote_code=True,
     )
     model = PeftModel.from_pretrained(model, args.ckpt)
@@ -335,7 +339,7 @@ def main():
         bank = ComponentBank(METADATA_CSV, TRAIN_IMG_DIR,
                              exclude_file=EXCLUDE_FILE, reclass_file=RECLASS_FILE)
 
-    with open(TEST_JSONL) as f:
+    with open(args.test_jsonl) as f:
         test_data = [json.loads(l) for l in f]
     n = args.num_samples if args.num_samples > 0 else len(test_data)
     samples = random.sample(test_data, min(n, len(test_data)))
@@ -347,6 +351,10 @@ def main():
         prompt     = msgs[1]["content"]
         gt_text    = msgs[2]["content"]
         image_name = sample.get("_meta", {}).get("image", f"sample_{idx:04d}")
+        pred_file = os.path.join(args.output_dir, f"{image_name}_pred.txt")
+        if os.path.exists(pred_file):
+            print(f"  [{idx+1:3d}/{len(samples)}] {image_name}: SKIPPED (exists)")
+            continue
 
         chat_msgs = [{"role": "system", "content": SYSTEM_MSG},
                      {"role": "user",   "content": prompt}]
@@ -368,7 +376,7 @@ def main():
             paste_img = paste_components(pred_comps, bank, top_k=args.top_k)
             paste_img.save(os.path.join(args.output_dir, f"{image_name}_paste.png"))
 
-        orig_path = os.path.join(BOARD_IMG_DIR, f"{image_name}.png")
+        orig_path = os.path.join(args.board_img_dir, f"{image_name}.png")
         orig_out  = os.path.join(args.output_dir, f"{image_name}_orig.png")
         if os.path.exists(orig_path):
             Image.open(orig_path).save(orig_out)

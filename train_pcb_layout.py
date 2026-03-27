@@ -125,7 +125,7 @@ def main():
         args.model_name,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        device_map="auto",
+        # device_map removed for DDP,
     )
 
     # LoRA config
@@ -142,7 +142,11 @@ def main():
 
     # Datasets
     train_dataset = PCBLayoutDataset(args.train_data, tokenizer, args.max_length)
-    val_dataset = PCBLayoutDataset(args.val_data, tokenizer, args.max_length)
+    if args.val_data and os.path.exists(args.val_data):
+        val_dataset = PCBLayoutDataset(args.val_data, tokenizer, args.max_length)
+    else:
+        val_dataset = None
+        print("No validation data found, skipping evaluation")
 
     # Check a sample
     sample = train_dataset[0]
@@ -165,9 +169,9 @@ def main():
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=3,
-        eval_strategy="steps",
-        eval_steps=args.save_steps,
-        load_best_model_at_end=True,
+        eval_strategy="steps" if val_dataset else "no",
+        eval_steps=args.save_steps if val_dataset else None,
+        load_best_model_at_end=True if val_dataset else False,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         report_to="wandb",

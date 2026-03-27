@@ -149,6 +149,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu", type=int, default=2)
     parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument("--test_jsonl", default=TEST_JSONL, help="Path to test.jsonl")
+    parser.add_argument("--base_model", default=BASE, help="Base model name")
     args = parser.parse_args()
 
     print(f"Loading model from {args.ckpt} ...")
@@ -159,7 +161,7 @@ def main():
     model = PeftModel.from_pretrained(model, args.ckpt)
     model.eval()
 
-    with open(TEST_JSONL) as f:
+    with open(args.test_jsonl) as f:
         test_data = [json.loads(l) for l in f]
 
     random.seed(args.seed)
