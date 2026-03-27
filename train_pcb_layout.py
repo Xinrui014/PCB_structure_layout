@@ -121,6 +121,17 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Register v3 special tokens (SUM_* and ORI_*)
+    v3_special_tokens = [
+        "[SUM_START]", "[SUM_RES]", "[SUM_CAP]", "[SUM_IND]", "[SUM_CON]",
+        "[SUM_DIO]", "[SUM_LED]", "[SUM_SWI]", "[SUM_TRN]", "[SUM_IC]", "[SUM_OSC]",
+        "[SUM_END]",
+        "[ORI_000]", "[ORI_045]", "[ORI_090]", "[ORI_135]",
+        "[ORI_180]", "[ORI_225]", "[ORI_270]", "[ORI_315]",
+    ]
+    num_added = tokenizer.add_tokens(v3_special_tokens, special_tokens=True)
+    print(f"Added {num_added} new special tokens (vocab size: {len(tokenizer)})")
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch.bfloat16,
@@ -137,6 +148,7 @@ def main():
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         bias="none",
     )
+    model.resize_token_embeddings(len(tokenizer))
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
